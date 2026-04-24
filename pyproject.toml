@@ -9,6 +9,7 @@ dependencies = [
     "matplotlib",
     "pillow",
     "numpy",
+    "openai-whisper>=20250625",
 ]
 
 [project.optional-dependencies]

@@ -1,16 +1,25 @@
-"""Transcribe a video with ElevenLabs Scribe.
+"""Transcribe a video with local Whisper (openai-whisper).
 
-Extracts mono 16kHz audio via ffmpeg, uploads to Scribe with verbatim +
-diarize + audio events + word-level timestamps, writes the full response
-to <edit_dir>/transcripts/<video_stem>.json.
+Extracts mono 16kHz audio via ffmpeg, runs Whisper with word-level
+timestamps, writes a Scribe-compatible JSON to <edit_dir>/transcripts/<stem>.json.
 
-Cached: if the output file already exists, the upload is skipped.
+Fork of the original ElevenLabs Scribe transcriber. Diarization and audio
+events (`(laughter)` etc.) are NOT produced — Whisper doesn't support them.
+All words get `speaker_id: "0"` so downstream helpers (pack_transcripts.py,
+render.py) keep working.
+
+Whisper model size controlled by WHISPER_MODEL env var (default "base").
+Options: tiny, base, small, medium, large-v2, large-v3. Quality vs speed
+tradeoff — `large-v3` is best for multilingual/Portuguese, `base` for
+fast iteration.
+
+Cached: if the output file already exists, the transcription is skipped.
 
 Usage:
     python helpers/transcribe.py <video_path>
     python helpers/transcribe.py <video_path> --edit-dir /custom/edit
-    python helpers/transcribe.py <video_path> --language en
-    python helpers/transcribe.py <video_path> --num-speakers 2
+    python helpers/transcribe.py <video_path> --language pt
+    python helpers/transcribe.py <video_path> --model large-v3
 """
 
 from __future__ import annotations
@@ -24,26 +33,13 @@ import tempfile
 import time
 from pathlib import Path
 
-import requests
-
-
-SCRIBE_URL = "https://api.elevenlabs.io/v1/speech-to-text"
-
 
 def load_api_key() -> str:
-    for candidate in [Path(__file__).resolve().parent.parent / ".env", Path(".env")]:
-        if candidate.exists():
-            for line in candidate.read_text().splitlines():
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                if k.strip() == "ELEVENLABS_API_KEY":
-                    return v.strip().strip('"').strip("'")
-    v = os.environ.get("ELEVENLABS_API_KEY", "")
-    if not v:
-        sys.exit("ELEVENLABS_API_KEY not found in .env or environment")
-    return v
+    """Backwards-compat shim — Whisper is local, no key needed.
+
+    Retained so `transcribe_batch.py` can import it without breaking.
+    """
+    return ""
 
 
 def extract_audio(video_path: Path, dest: Path) -> None:
@@ -55,50 +51,69 @@ def extract_audio(video_path: Path, dest: Path) -> None:
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def call_scribe(
+def call_whisper(
     audio_path: Path,
-    api_key: str,
     language: str | None = None,
-    num_speakers: int | None = None,
+    model_size: str | None = None,
 ) -> dict:
-    data: dict[str, str] = {
-        "model_id": "scribe_v1",
-        "diarize": "true",
-        "tag_audio_events": "true",
-        "timestamps_granularity": "word",
+    """Run openai-whisper locally and return a Scribe-compatible payload.
+
+    Shape returned (matches what pack_transcripts.py and render.py expect):
+        {
+          "language_code": "pt",
+          "text": "full transcript string",
+          "words": [
+            {"text": "hello", "type": "word", "start": 0.0, "end": 0.3, "speaker_id": "0"},
+            ...
+          ]
+        }
+    """
+    # Import lazily — loading whisper is slow (~1s); defer until needed.
+    import whisper  # type: ignore
+
+    size = model_size or os.getenv("WHISPER_MODEL", "base")
+    model = whisper.load_model(size)
+    result = model.transcribe(
+        str(audio_path),
+        word_timestamps=True,
+        language=language,
+    )
+
+    words: list[dict] = []
+    for segment in result.get("segments", []):
+        for w in segment.get("words", []):
+            text = (w.get("word") or "").strip()
+            if not text:
+                continue
+            words.append({
+                "text": text,
+                "type": "word",
+                "start": round(float(w["start"]), 3),
+                "end": round(float(w["end"]), 3),
+                "speaker_id": "0",
+            })
+
+    return {
+        "language_code": result.get("language", "unknown"),
+        "text": result.get("text", "").strip(),
+        "words": words,
     }
-    if language:
-        data["language_code"] = language
-    if num_speakers:
-        data["num_speakers"] = str(num_speakers)
-
-    with open(audio_path, "rb") as f:
-        resp = requests.post(
-            SCRIBE_URL,
-            headers={"xi-api-key": api_key},
-            files={"file": (audio_path.name, f, "audio/wav")},
-            data=data,
-            timeout=1800,
-        )
-
-    if resp.status_code != 200:
-        raise RuntimeError(f"Scribe returned {resp.status_code}: {resp.text[:500]}")
-
-    return resp.json()
 
 
 def transcribe_one(
     video: Path,
     edit_dir: Path,
-    api_key: str,
+    api_key: str = "",          # ignored; kept for compat with transcribe_batch.py
     language: str | None = None,
-    num_speakers: int | None = None,
+    num_speakers: int | None = None,  # ignored; Whisper doesn't diarize
     verbose: bool = True,
 ) -> Path:
     """Transcribe a single video. Returns path to transcript JSON.
 
     Cached: returns existing path immediately if the transcript already exists.
     """
+    del api_key, num_speakers  # unused — Whisper is local and mono-speaker
+
     transcripts_dir = edit_dir / "transcripts"
     transcripts_dir.mkdir(parents=True, exist_ok=True)
     out_path = transcripts_dir / f"{video.stem}.json"
@@ -117,8 +132,11 @@ def transcribe_one(
         extract_audio(video, audio)
         size_mb = audio.stat().st_size / (1024 * 1024)
         if verbose:
-            print(f"  uploading {video.stem}.wav ({size_mb:.1f} MB)", flush=True)
-        payload = call_scribe(audio, api_key, language, num_speakers)
+            print(
+                f"  whisper transcribing {video.stem}.wav ({size_mb:.1f} MB)",
+                flush=True,
+            )
+        payload = call_whisper(audio, language=language)
 
     out_path.write_text(json.dumps(payload, indent=2))
     dt = time.time() - t0
@@ -126,14 +144,13 @@ def transcribe_one(
     if verbose:
         kb = out_path.stat().st_size / 1024
         print(f"  saved: {out_path.name} ({kb:.1f} KB) in {dt:.1f}s")
-        if isinstance(payload, dict) and "words" in payload:
-            print(f"    words: {len(payload['words'])}")
+        print(f"    words: {len(payload['words'])}")
 
     return out_path
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Transcribe a video with ElevenLabs Scribe")
+    ap = argparse.ArgumentParser(description="Transcribe a video with local Whisper")
     ap.add_argument("video", type=Path, help="Path to video file")
     ap.add_argument(
         "--edit-dir",
@@ -145,13 +162,21 @@ def main() -> None:
         "--language",
         type=str,
         default=None,
-        help="Optional ISO language code (e.g., 'en'). Omit to auto-detect.",
+        help="Optional ISO language code (e.g., 'pt', 'en'). Omit to auto-detect.",
     )
+    ap.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Whisper model size (tiny/base/small/medium/large-v3). "
+             "Overrides WHISPER_MODEL env var.",
+    )
+    # --num-speakers kept but ignored (Whisper doesn't diarize)
     ap.add_argument(
         "--num-speakers",
         type=int,
         default=None,
-        help="Optional number of speakers when known. Improves diarization accuracy.",
+        help="Ignored — Whisper doesn't diarize. Kept for CLI compat.",
     )
     args = ap.parse_args()
 
@@ -159,15 +184,15 @@ def main() -> None:
     if not video.exists():
         sys.exit(f"video not found: {video}")
 
+    if args.model:
+        os.environ["WHISPER_MODEL"] = args.model
+
     edit_dir = (args.edit_dir or (video.parent / "edit")).resolve()
-    api_key = load_api_key()
 
     transcribe_one(
         video=video,
         edit_dir=edit_dir,
-        api_key=api_key,
         language=args.language,
-        num_speakers=args.num_speakers,
     )
 
 
